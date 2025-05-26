@@ -1,0 +1,1318 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Little Discs</title>
+  <style>
+    body { margin:0; }
+    #toolbar {
+      position:fixed; top:10px; left:10px; z-index:10;
+      background:#fff; padding:8px; border-radius:8px;
+    }
+    #canvas { background: #f0ffff; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+<div id="toolbar">
+  <div id="modeRadios">
+    <label>
+      <input type="radio" name="mode" value="constraint">
+      Setter Mode
+    </label>
+    <label>
+      <input type="radio" name="mode" value="move" checked>
+      Solver Mode
+    </label>
+  </div>
+  <button id="addDisc" class="hidden">Add Disc (disabled)</button>
+  <select id="constraintType">
+    <option value="polygon">Polygon</option>
+    <option value="rectangle">Rectangle</option>
+    <option value="ellipse">Ellipse</option>
+  </select>
+  <button id="undoPoly" class="hidden">Undo</button>
+  <button id="cancelPoly" class="hidden">Cancel</button>
+  <button id="deleteBtn" class="hidden">Delete</button>
+  <button id="saveBtn" onclick="saveConstraintsToURL()">Save constraints</button>
+</div>
+<canvas id="canvas" resize width="1000" height="700"></canvas>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/paper.js/0.12.17/paper-full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lz-string@1.4.4/libs/lz-string.min.js"></script>
+
+<script>
+paper.settings.hitTolerance = 30;  // make strokes easier to grab
+paper.setup('canvas');
+paper.view.element.addEventListener('contextmenu', function(e) {
+    e.preventDefault();
+});
+
+// --- App State ---
+let mode = document.querySelector('input[name="mode"]:checked').value;
+let constraintType = document.getElementById('constraintType').value;
+let constraints = [];
+let discs = [];
+let discRadius = 12;
+let maxDiscsPerConstraint = 3;
+let discPreview = null;
+let creatingPolygon = false;
+let polygonPoints = [];
+let polygonTempPath = null;
+let polygonTempHandles = [];
+let selectedObj = null;
+let vertexHandles = [];
+let exclusionLayer = new paper.Layer();
+let discLayer = new paper.Layer();
+let constraintLayer = new paper.Layer();
+let uiLayer = new paper.Layer();
+exclusionLayer.activate();
+
+function enterMode(mode) {
+  this.mode = mode;
+  this.currentConstraint = null;
+  constraintLayer.locked = (this.mode === "move");
+}
+enterMode(mode);
+
+// --- UI Controls ---
+// Listen for changes on the radio group
+document.getElementById('modeRadios').addEventListener('change', (e) => {
+  if (e.target.name === 'mode') {
+    mode = e.target.value;
+    enterMode(mode);
+  }
+});
+document.getElementById('constraintType').addEventListener('change', e => {
+  constraintType = e.target.value;
+});
+//document.getElementById('addDisc').addEventListener('click', () => {
+//  showDiscPreview(new paper.Point(400, 300));
+//});
+document.getElementById('undoPoly').onclick = undoPolygonPoint;
+document.getElementById('cancelPoly').onclick = cancelPolygon;
+document.getElementById('deleteBtn').onclick = deleteSelected;
+
+// --- Tool Setup ---
+let tool = new paper.Tool();
+tool.onMouseDown = function(event) {
+  if (mode === 'constraint') {
+    if (constraintType === 'polygon') {
+      handlePolygonCreation(event.point);
+    } else if (constraintType === 'rectangle') {
+      if (!checkOtherHit(event.point)) {
+        selectConstraint(createRectangleConstraint(3, event.point, 80, 80, 0));
+      }
+    } else if (constraintType === 'ellipse') {
+      if (!checkOtherHit(event.point)) {
+        selectConstraint(createEllipseConstraint(3, event.point, 80, 80, 0));
+      }
+    }
+  } else if (mode === 'move') {
+    // handled by disc drag logic
+  }
+};
+tool.onMouseMove = function(event) {
+  if (creatingPolygon && polygonPoints.length > 0) {
+    updatePolygonPreview(event.point);
+  }
+  if (discPreview) {
+    discPreview.position = event.point;
+    updateDiscPreviewColor(event.point);
+  }
+};
+tool.onMouseUp = function(event) {
+  //if (discPreview)
+  if (mode === 'move') {
+    if (isValidDiscPosition(event.point)) {
+      addDisc(event.point);
+    }
+    removeDiscPreview();
+  }
+};
+
+function checkOtherHit(point) {
+  let hitProject = paper.project.hitTest(point, { fill: true, stroke: true, tolerance: 0 });
+  if (hitProject && hitProject.item) {console.log("Hit project item:", hitProject.item);}
+  if (hitProject && hitProject.item && hitProject.item.data.isDisc) return true;
+  // Check handles (uiLayer)
+  let hitHandle = uiLayer.hitTest(point, { fill: true, stroke: true, tolerance: 6 });
+  if (hitHandle && hitHandle.item) {console.log("Hit ui item:", hitHandle.item);}
+  if (hitHandle && hitHandle.item && (hitHandle.item.data.isHandle||hitHandle.item.data.isBadge)) return true;
+  // Check constraints (constraintLayer)
+  let hitConstraint = constraintLayer.hitTest(point, { fill: true, stroke: true, tolerance: 6 });
+  if (hitConstraint && hitConstraint.item) {console.log("Hit constraint:", hitConstraint.item);}
+  if (hitConstraint && hitConstraint.item && (hitConstraint.item.data.isConstraint||hitConstraint.item.data.isBadge)) return true;
+  return false;
+}
+
+// --- Polygon Creation ---
+function handlePolygonCreation(point) {
+  // Only check for existing constraint when starting
+  if (!creatingPolygon) {
+    if (checkOtherHit(point)) return;
+    creatingPolygon = true;
+    polygonPoints = [point];
+    polygonTempPath = new paper.Path({
+      segments: [point],
+      strokeColor: 'red',
+      strokeWidth: 4,
+      fullySelected: false,
+      dashArray: [6, 6]
+    });
+    polygonTempHandles = [drawTempHandle(point)];
+    document.getElementById('undoPoly').classList.remove('hidden');
+    document.getElementById('cancelPoly').classList.remove('hidden');
+    return;
+  }
+  // Check if closing polygon (near first point)
+  if (polygonPoints.length >= 3 && point.getDistance(polygonPoints[0]) < 15) {
+    // Complete polygon
+    selectConstraint(createPolygonConstraint(3, polygonPoints));
+    removePolygonPreview();
+    creatingPolygon = false;
+    document.getElementById('undoPoly').classList.add('hidden');
+    document.getElementById('cancelPoly').classList.add('hidden');
+    return;
+  }
+  // Add point
+  polygonPoints.push(point);
+  polygonTempPath.add(point);
+  polygonTempHandles.push(drawTempHandle(point));
+}
+
+function createPolygonConstraint(numDiscs, polygonPoints) {
+  let poly = new paper.Path({
+    segments: polygonPoints,
+    closed: true,
+    fillColor: null,  // new paper.Color(1,0,0,0.1),
+    strokeColor: 'red',
+    strokeWidth: 4,
+    data: { isConstraint: true, type: 'polygon', discs: [], maxDiscs: numDiscs }
+  });
+  constraintLayer.addChild(poly);
+  addConstraintLabel(poly);
+
+  let dragOffset = null;
+  let isDragging = false;
+  poly.onMouseDown = function(e) {
+    if (e.hitResult && e.hitResult.item && e.hitResult.item.data.isHandle) return;
+    // Check hit was on stroke not interior
+    //let hit = poly.hitTest(e.point, { stroke: true, fill: false, tolerance: 12 });
+    //if (!hit) return;
+    dragOffset = poly.position.subtract(e.point);
+    isDragging = false;
+  };
+  poly.onMouseDrag = function(e) {
+    if (dragOffset) {
+      isDragging = true;
+      let newPos = e.point.add(dragOffset);
+      let delta = newPos.subtract(poly.position);
+      poly.position = newPos;
+      updateConstraintBadge(poly);
+      updateDiscsForConstraint();
+      updateExclusionZones();
+      showVertexHandles(poly);
+    }
+  };
+  poly.onMouseUp = function(e) {
+    dragOffset = null;
+    //if (!isDragging) {
+      selectConstraint(poly);
+    //}
+  };
+  constraints.push(poly);
+  return poly;
+}
+
+function updatePolygonPreview(mousePoint) {
+  if (polygonTempPath) {
+    polygonTempPath.segments.length = polygonPoints.length;
+    polygonTempPath.add(mousePoint);
+  }
+}
+
+function drawTempHandle(point) {
+  let handle = new paper.Path.Circle({
+    center: point,
+    radius: 5,
+    fillColor: 'red',
+    strokeColor: 'white',
+    strokeWidth: 1,
+    data: {isHandle: true}
+  });
+  uiLayer.addChild(handle);
+  return handle;
+}
+
+function undoPolygonPoint() {
+  if (polygonPoints.length > 1) {
+    polygonPoints.pop();
+    if (polygonTempPath) polygonTempPath.removeSegment(polygonTempPath.segments.length - 2);
+    let h = polygonTempHandles.pop();
+    if (h) h.remove();
+  }
+}
+
+function cancelPolygon() {
+  removePolygonPreview();
+  creatingPolygon = false;
+  document.getElementById('undoPoly').classList.add('hidden');
+  document.getElementById('cancelPoly').classList.add('hidden');
+}
+
+function removePolygonPreview() {
+  if (polygonTempPath) polygonTempPath.remove();
+  polygonTempPath = null;
+  polygonPoints = [];
+  polygonTempHandles.forEach(h => h.remove());
+  polygonTempHandles = [];
+}
+
+// --- Rectangle/Ellipse Constraint Creation ---
+function createRectangleConstraint(numDiscs, centre, width, height, rotation) {
+  let rect = new paper.Path.Rectangle({
+    point: [centre.x - width/2, centre.y - height/2],
+    size: [width, height],
+    fillColor: null,  // new paper.Color(0,0,1,0.1),
+    strokeColor: 'blue',
+    strokeWidth: 4,
+    data: { isConstraint: true, type: 'rectangle', discs: [], maxDiscs: numDiscs }
+  });
+  rect.rotate(rotation, centre);
+  constraintLayer.addChild(rect);
+  addConstraintLabel(rect);
+  //rect.onMouseDown = function(e) { selectConstraint(rect); };
+  //rect.on('mousedrag', function(e) { moveConstraint(rect, e); });
+
+  rect.data.getRotation = function() {
+    let startCenter = rect.segments[0].point.add(rect.segments[2].point).divide(2);
+    let v1 = rect.segments[1].point.subtract(rect.segments[0].point);
+    let v2 = rect.segments[3].point.subtract(rect.segments[0].point);
+    return { angle: v1.angle, width: v1.length, height: v2.length };
+  };
+
+  // Rectangle drag logic:
+  let dragOffset = null;
+  let isDragging = false;
+  rect.onMouseDown = function(e) {
+    //if (e.hitResult && e.hitResult.item) {console.log("Hit result for mousedown: ",e.hitResult.item);}
+    if (e.hitResult && e.hitResult.item && e.hitResult.item.data.isHandle) return;
+    // Check hit was on stroke not interior
+    let hit = rect.hitTest(e.point, { stroke: true, fill: false, tolerance: 12 });
+    //console.log("Hittest result for mousedown: ",hit);
+    if (!hit) return;
+    dragOffset = rect.position.subtract(e.point);
+    isDragging = false;
+  };
+  rect.onMouseDrag = function(e) {
+    if (dragOffset) {
+      isDragging = true;
+      let newPos = e.point.add(dragOffset);
+      let delta = newPos.subtract(rect.position);
+      for (let i = 0; i < 4; i++) {
+        rect.segments[i].point = rect.segments[i].point.add(delta);
+      }
+      rect.position = newPos;
+      updateConstraintBadge(rect);
+      updateDiscsForConstraint();
+      updateExclusionZones();
+      showRectHandles(rect);
+    }
+  };
+  rect.onMouseUp = function(e) {
+    dragOffset = null;
+    //if (!isDragging) {
+      selectConstraint(rect);
+    //}
+  };
+
+  constraints.push(rect);
+  return rect;
+}
+
+function createEllipseConstraint(numDiscs, centre, width, height, rotation) {
+  let ellipse = new paper.Path.Ellipse({
+    center: centre,
+    radius: [width/2, height/2],
+    fillColor: null,  // new paper.Color(0,1,0,0.1),
+    strokeColor: 'green',
+    strokeWidth: 4,
+    data: { isConstraint: true, type: 'ellipse', discs: [], maxDiscs: numDiscs }
+  });
+  ellipse.rotate(rotation, centre);
+  constraintLayer.addChild(ellipse);
+  addConstraintLabel(ellipse);
+  //ellipse.onMouseDown = function(e) { selectConstraint(ellipse); };
+  //ellipse.on('mousedrag', function(e) { moveConstraint(ellipse, e); });
+
+  ellipse.data.getRotation = function() {
+    let startCenter = ellipse.position.clone();
+    let localY = ellipse.segments[0].point.subtract(startCenter);
+    let localX = ellipse.segments[1].point.subtract(startCenter);
+    return { angle: localX.angle, width: 2*localX.length, height: 2*localY.length };
+  };
+
+  let dragOffset = null;
+  let isDragging = false;
+  ellipse.onMouseDown = function(e) {
+    if (e.hitResult && e.hitResult.item && e.hitResult.item.data.isHandle) return;
+    // Check hit was on stroke not interior
+    let hit = ellipse.hitTest(e.point, { stroke: true, fill: false, tolerance: 12 });
+    if (!hit) return;
+    dragOffset = ellipse.position.subtract(e.point);
+    isDragging = false;
+  };
+  ellipse.onMouseDrag = function(e) {
+    if (dragOffset) {
+      isDragging = true;
+      let newPos = e.point.add(dragOffset);
+      let delta = newPos.subtract(ellipse.position);
+      for (let i = 0; i < ellipse.segments.length; i++) {
+        ellipse.segments[i].point = ellipse.segments[i].point.add(delta);
+      }
+      ellipse.position = newPos;
+      updateConstraintBadge(ellipse);
+      updateDiscsForConstraint();
+      updateExclusionZones();
+      showEllipseHandles(ellipse);
+    }
+  };
+  ellipse.onMouseUp = function(e) {
+    dragOffset = null;
+    //if (!isDragging) {
+      selectConstraint(ellipse);
+    //}
+  };
+
+  constraints.push(ellipse);
+  return ellipse;
+}
+
+// --- Disc Placement ---
+function addDisc(point) {
+  let disc = new paper.Path.Circle({
+    center: point,
+    radius: discRadius,
+    fillColor: 'black',
+    opacity: 0.7,
+    data: { isDisc: true, isDragging: false }
+  });
+  discLayer.addChild(disc);
+  discs.push(disc);
+  let dragOffset = null;
+  // selectDisc is mainly so that you can delete it.
+  // The expected action on mousedown is that you're going to drag.
+  disc.on('mousedown', function(e) {
+    selectDisc(disc);
+    dragOffset = disc.position.subtract(e.point);
+  });
+let drag_fn = function(e) {
+  let startPos = disc.position.clone();
+  let targetPos = e.point.add(dragOffset);
+
+  // If the target is valid, just move there
+  if (isValidDiscPosition(targetPos, disc)) {
+    disc.position = targetPos;
+  } else {
+    // Binary search for the closest valid position along the drag vector
+    let low = 0, high = 1, best = startPos.clone();
+    for (let i = 0; i < 10; i++) { // 10 iterations for subpixel precision
+      let mid = (low + high) / 2;
+      let testPos = startPos.add(targetPos.subtract(startPos).multiply(mid));
+      if (isValidDiscPosition(testPos, disc)) {
+        best = testPos;
+        low = mid; // Try further along
+      } else {
+        high = mid; // Try closer
+      }
+    }
+    disc.position = best;
+  }
+
+  disc.data.isDragging = true;
+  updateDiscsForConstraint();
+  updateExclusionZones();
+};
+
+  //let drag_fn = function(e) {
+  //  let newPos = e.point.add(dragOffset);
+  //  if (isValidDiscPosition(newPos, disc)) {
+  //    disc.position = e.point.add(dragOffset);
+  //    disc.data.isDragging = true;
+  //    updateDiscsForConstraint();
+  //    updateExclusionZones();
+  //  }
+  //};
+  disc.on('mousedown', drag_fn);
+  disc.on('mousedrag', drag_fn);
+  disc.onMouseUp = function(e) {
+    disc.data.isDragging = false;
+    updateExclusionZones();
+ }
+  updateDiscsForConstraint();
+  updateExclusionZones();
+  selectDisc(disc);
+}
+
+function showDiscPreview(point) {
+  removeDiscPreview();
+  discPreview = new paper.Path.Circle({
+    center: point,
+    radius: discRadius,
+    fillColor: new paper.Color(0.26,0.53,0.96,0.5)
+  });
+  uiLayer.addChild(discPreview);
+  updateDiscPreviewColor(point);
+}
+
+function removeDiscPreview() {
+  if (discPreview) discPreview.remove();
+  discPreview = null;
+}
+
+function updateDiscPreviewColor(point) {
+  if (!discPreview) return;
+  if (isValidDiscPosition(point)) {
+    discPreview.fillColor = new paper.Color(0.26,0.53,0.96,0.5);
+  } else {
+    discPreview.fillColor = new paper.Color(1,0,0,0.5);
+  }
+}
+
+// --- Disc/Constraint Relationship ---
+function updateDiscsForConstraint() {
+  for (const c of constraints) c.data.discs = [];
+  for (const d of discs) {
+    for (const c of constraints) {
+      if (isInsideConstraint(d.position, c)) {
+        c.data.discs.push(d);
+      }
+    }
+  }
+  for (const c of constraints) updateConstraintBadge(c);
+}
+
+// --- Constraint Containment ---
+function isInsideConstraint(point, constraint) {
+  return constraint.contains(point);
+}
+function crossesConstraint(point, constraint) {
+  if (constraint.data.type === 'ellipse') {
+    let d = distanceToRotatedEllipse(
+        point, constraint.position,
+        constraint.segments[0].point,
+        constraint.segments[2].point,
+        constraint.segments[1].point,
+        constraint.segments[3].point);
+    return (d < discRadius);
+  }
+  if (constraint.data.type === 'rectangle') {
+    let r = constraint.data.getRotation();
+    let d = distanceToRotatedRectangle(
+        point, constraint.position,
+        r.width, r.height, r.angle);
+    return (d < discRadius);
+  }
+  return false;
+}
+
+/**
+ * Compute the minimum distance from point P to a possibly rotated ellipse.
+ * @param {paper.Point} P - The query point.
+ * @param {paper.Point} center - Center of the ellipse.
+ * @param {paper.Point} axisA1 - One end of major axis.
+ * @param {paper.Point} axisA2 - Other end of major axis.
+ * @param {paper.Point} axisB1 - One end of minor axis.
+ * @param {paper.Point} axisB2 - Other end of minor axis.
+ * @returns {Object} { distance: Number, closest: paper.Point }
+ */
+function distanceToRotatedEllipse(P, center, axisA1, axisA2, axisB1, axisB2) {
+    // Step 1: Compute axis directions and lengths
+    let majorVec = axisA1.subtract(center);
+    let minorVec = axisB1.subtract(center);
+    let a = majorVec.length;
+    let b = minorVec.length;
+    let U0 = majorVec.normalize(); // major axis unit vector
+    let U1 = minorVec.normalize(); // minor axis unit vector
+
+    // Step 2: Initial guess for theta
+    let dP = P.subtract(center);
+    let px = dP.dot(U0);
+    let py = dP.dot(U1);
+    let theta = Math.atan2(py * a, px * b);
+
+    // Step 3: Newton's method in global coordinates
+    let maxIter = 100;
+    let tol = 1e-10;
+    for (let i = 0; i < maxIter; i++) {
+        let cost = Math.cos(theta);
+        let sint = Math.sin(theta);
+
+        // Q(theta) in world coordinates
+        let Q = center.add(U0.multiply(a * cost)).add(U1.multiply(b * sint));
+        let V = Q.subtract(P);
+
+        // Q'(theta)
+        let Qp = U0.multiply(-a * sint).add(U1.multiply(b * cost));
+
+        // Q''(theta)
+        let Qpp = U0.multiply(-a * cost).add(U1.multiply(-b * sint));
+
+        // Derivative of squared distance
+        let f = V.dot(Qp);
+
+        // Second derivative
+        let fp = Qp.dot(Qp) + V.dot(Qpp);
+
+        let t = theta - f / fp;
+        if (Math.abs(t - theta) < tol) break;
+        theta = t;
+    }
+
+    // Closest point in world coordinates
+    let cost = Math.cos(theta);
+    let sint = Math.sin(theta);
+    let closest = center.add(U0.multiply(a * cost)).add(U1.multiply(b * sint));
+    let distance = closest.getDistance(P);
+
+    return distance;
+}
+
+/**
+ * Compute the minimum distance from point P to the perimeter of a possibly rotated rectangle.
+ * @param {paper.Point} P - The query point.
+ * @param {paper.Point} center - Center of the rectangle.
+ * @param {number} width - Width of the rectangle.
+ * @param {number} height - Height of the rectangle.
+ * @param {number} angle - Rotation angle in radians (counterclockwise from x-axis).
+ * @returns {Object} { distance: Number, closest: paper.Point }
+ */
+function distanceToRotatedRectangle(P, center, width, height, angle) {
+    // Step 1: Move P to rectangle's local frame (centered at origin, unrotated)
+    let dP = P.subtract(center);
+
+    // Rotate by -angle to align rectangle with axes
+    let cosA = Math.cos(-angle*Math.PI/180);
+    let sinA = Math.sin(-angle*Math.PI/180);
+    let localX = dP.x * cosA - dP.y * sinA;
+    let localY = dP.x * sinA + dP.y * cosA;
+
+    // Step 2: Find closest point on the perimeter in local frame
+    let halfW = width / 2;
+    let halfH = height / 2;
+    let clampedX = Math.max(-halfW, Math.min(localX, halfW));
+    let clampedY = Math.max(-halfH, Math.min(localY, halfH));
+
+    // If inside, project to nearest edge
+    if (localX > -halfW && localX < halfW && localY > -halfH && localY < halfH) {
+        let dx = Math.min(localX + halfW, halfW - localX);
+        let dy = Math.min(localY + halfH, halfH - localY);
+        if (dx < dy) {
+            clampedX = (localX < 0) ? -halfW : halfW;
+            clampedY = localY;
+        } else {
+            clampedX = localX;
+            clampedY = (localY < 0) ? -halfH : halfH;
+        }
+    }
+
+    // Step 3: Rotate the closest point back to world frame
+    let cosB = Math.cos(angle*Math.PI/180);
+    let sinB = Math.sin(angle*Math.PI/180);
+    let worldX = clampedX * cosB - clampedY * sinB;
+    let worldY = clampedX * sinB + clampedY * cosB;
+    let closest = center.add(new paper.Point(worldX, worldY));
+
+    // Step 4: Compute the distance
+    let distance = closest.getDistance(P);
+
+    return distance;
+}
+
+
+
+// --- Exclusion Zones (forbidden cones) ---
+function updateExclusionZones() {
+  exclusionLayer.removeChildren();
+  exclusionLayer.activate();
+  for (let i = 0; i < discs.length; i++) {
+    for (let j = i+1; j < discs.length; j++) {
+      drawForbiddenZone(discs[i], discs[j], (discs[i].data.isDragging || discs[j].data.isDragging));
+    }
+  }
+  discLayer.activate();
+}
+
+function drawForbiddenZone(discA, discB, preview = false) {
+  const a = discA.position;
+  const b = discB.position;
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const cx = (b.x + a.x)/2;
+  const cy = (b.y + a.y)/2;
+  const AB = Math.hypot(dx, dy);
+  const dirAB = Math.atan2(dy, dx);
+  const r = discRadius;
+  const theta = 2 * Math.asin(2*r / AB);
+
+  // Calculate cone directions
+  const dirAB1 = dirAB + theta/2;
+  const dirAB2 = dirAB - theta/2;
+  const dirBA1 = dirAB + Math.PI - theta/2;
+  const dirBA2 = dirAB + Math.PI + theta/2;
+
+  // Calculate extended points for cones
+  const coneLength = 10000;
+  const aCone1 = new paper.Point(cx + Math.cos(dirAB1)*coneLength, cy + Math.sin(dirAB1)*coneLength);
+  const aCone2 = new paper.Point(cx + Math.cos(dirAB2)*coneLength, cy + Math.sin(dirAB2)*coneLength);
+  const bCone1 = new paper.Point(cx + Math.cos(dirBA1)*coneLength, cy + Math.sin(dirBA1)*coneLength);
+  const bCone2 = new paper.Point(cx + Math.cos(dirBA2)*coneLength, cy + Math.sin(dirBA2)*coneLength);
+
+  let compoundPath = new paper.CompoundPath({
+    fillColor: new paper.Color(0.8,0.8,0.8, (preview ? 0.0 : 0.4)),
+    opacity: 1.0,
+    guide: true,
+    strokeColor: new paper.Color(0.0,0.0,0.0,1.0),
+                          dashArray: [4,8],
+    strokeWidth: (preview ? 1 : 0)
+  });
+
+  // Draw first cone (A to B)
+  //let cone1 = new paper.Path([new paper.Point(cx, cy), aCone2, aCone1]);
+  //cone1.closed = true;
+  //cone1.fillColor = new paper.Color(0.8,0.8,0.8,0.3);
+  //compoundPath.addChild(cone1);
+
+  // Draw second cone (B to A)
+  //let cone2 = new paper.Path([new paper.Point(cx, cy), bCone1, bCone2]);
+  //cone2.closed = true;
+  //cone2.fillColor = new paper.Color(0.8,0.8,0.8,0.3);
+  //compoundPath.addChild(cone2);
+
+  // Draw convex hull rectangle (band)
+  const perpAngle1 = dirAB + Math.PI/2 + theta/2;
+  const perpDx1 = Math.cos(perpAngle1) * r / Math.cos(theta/4);
+  const perpDy1 = Math.sin(perpAngle1) * r / Math.cos(theta/4);
+  const perpAngle2 = dirAB + Math.PI/2 - theta/2;
+  const perpDx2 = Math.cos(perpAngle2) * r / Math.cos(theta/4);
+  const perpDy2 = Math.sin(perpAngle2) * r / Math.cos(theta/4);
+
+  let band = new paper.Path([
+    bCone1,
+    new paper.Point(a.x + perpDx2, a.y + perpDy2),
+    new paper.Point(b.x + perpDx1, b.y + perpDy1),
+    aCone1,
+    aCone2,
+    new paper.Point(b.x - perpDx2, b.y - perpDy2),
+    new paper.Point(a.x - perpDx1, a.y - perpDy1),
+    bCone2
+  ]);
+  band.closed = true;
+  compoundPath.addChild(band);
+  //band.fillColor = new paper.Color(0.8,0.8,0.8,0.3);
+}
+
+// --- Forbidden Cone Logic for Placement ---
+function isInForbiddenCone(p, aDisc, bDisc) {
+  const a = aDisc.position;
+  const b = bDisc.position;
+  const AB = a.getDistance(b);
+  const totalWidth = 4*discRadius;
+  const bandWidth = 2*discRadius;
+  // Check central band first
+  const bandDistance = Math.abs(
+      (b.y - a.y)*p.x - (b.x - a.x)*p.y + b.x*a.y - a.x*b.y
+  ) / AB;
+  if (bandDistance < bandWidth) {
+      const AP = a.getDistance(p);
+      const BP = b.getDistance(p);
+      //if (AP <= AB + bandWidth && BP <= AB + bandWidth) {
+          return true;
+      //}
+  }
+  //if (AB > totalWidth) {
+      const theta = 2 * Math.asin(bandWidth / AB);
+      const dir = Math.atan2(b.y - a.y, b.x - a.x);
+
+      const angleAP = Math.atan2(p.y - a.y, p.x - a.x) - dir;
+      const angleBP = Math.atan2(p.y - b.y, p.x - b.x) - (dir - Math.PI);
+
+      const normalize = angle => (angle + Math.PI) % (2*Math.PI) - Math.PI;
+
+      return Math.abs(normalize(angleAP)) < theta/2 || 
+             Math.abs(normalize(angleBP)) < theta/2;
+  //}
+  return false;
+}
+
+// --- Disc Placement Validation ---
+function isValidDiscPosition(pos, movingDisc = null) {
+  // 1. Proximity check
+  for (const d of discs) {
+    if (d === movingDisc) continue;
+    if (d.position.getDistance(pos) < 2 * discRadius) return false;
+  }
+  // 2. Forbidden cone check
+  for (let i = 0; i < discs.length; i++) {
+    for (let j = i+1; j < discs.length; j++) {
+      const a = discs[i], b = discs[j];
+      if (a === movingDisc || b === movingDisc) continue;
+      if (isInForbiddenCone(pos, a, b)) return false;
+    }
+  }
+  // 3. Constraint check
+  for (const constraint of constraints) {
+    if (crossesConstraint(pos, constraint)) {
+      return false;
+    }
+    if (isInsideConstraint(pos, constraint)) {
+      if ((constraint.data.discs.length >= constraint.data.maxDiscs) &&
+          (!movingDisc || !constraint.data.discs.includes(movingDisc))) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// --- Constraint Label ---
+function addConstraintLabel(constraint) {
+  let center = constraint.position;
+  let label = new paper.PointText({
+    point: center,
+    content: '',  // '0/' + constraint.data.maxDiscs,
+    fillColor: 'black',
+    fontSize: 18,
+    guide: true,  // pass through clicks
+    justification: 'center'
+  });
+  constraint.data.label = label;
+  uiLayer.addChild(label);
+  updateConstraintBadge(constraint);
+}
+function getConstraintBadgeLocation(constraint) {
+  if (constraint.data.label) {
+    //constraint.data.label.content = constraint.data.discs.length + '/' + constraint.data.maxDiscs;
+if (constraint.data.type === 'rectangle') {
+    let seg0 = constraint.segments[0].point;
+    let seg1 = constraint.segments[1].point;
+    let midpoint = seg0.add(seg1).divide(2);
+    return midpoint;
+}
+if (constraint.data.type === 'ellipse') {
+    let seg0 = constraint.segments[0].point;
+    return seg0;
+}
+if (constraint.data.type === 'polygon') {
+    let seg0 = constraint.segments[0].point;
+    let seg1 = constraint.segments[1].point;
+    let midpoint = seg0.add(seg1).divide(2);
+    return midpoint;
+}
+  }
+ }
+
+function updateConstraintBadge(constraint) {
+    // Remove old badge if it exists
+    if (constraint.data.badgeGroup) {
+        constraint.data.badgeGroup.remove();
+    }
+
+    // --- Determine badge color ---
+    let outlineColor = constraint.strokeColor || 'blue'; // Or however you set the outline color
+    let current = constraint.data.discs.length;
+    let max = constraint.data.maxDiscs;
+
+    // --- Determine number color ---
+    let numberColor;
+    if (current < max) {
+        numberColor = 'white';
+    } else if (current === max) {
+        numberColor = '#6f6'; // light green
+    } else {
+        numberColor = '#f88'; // light red
+    }
+
+    constraintLayer.activate();
+    // --- Create badge disk ---
+    let badgeRadius = 12;
+    let badgeCircle = new paper.Path.Circle({
+        center: [0, 0],
+        radius: badgeRadius,
+        data: {isBadge: true},
+        fillColor: outlineColor,
+        strokeColor: 'white',
+        strokeWidth: 1,
+        shadowColor: 'rgba(0,0,0,0.07)',
+        shadowBlur: 2
+    });
+
+    // --- Create number text ---
+    let badgeText = new paper.PointText({
+        point: [0, 6], // Adjust for vertical centering
+        content: max,
+        data: {isBadge: true},
+        fillColor: numberColor,
+        fontFamily: 'sans-serif',
+        fontWeight: 'bold',
+        fontSize: 18,
+        justification: 'center'
+    });
+
+    // --- Group badge and text ---
+    let badgeGroup = new paper.Group([badgeCircle, badgeText]);
+    badgeGroup.applyMatrix = false; // So you can position it easily
+
+    // --- Position badge ---
+    badgeGroup.position = getConstraintBadgeLocation(constraint);
+
+badgeGroup.onMouseDown = function(event) {
+    // Left-click: event.event.button === 0
+    // Right-click: event.event.button === 2
+    if (event.event.button === 0) {
+        // Increase constraint number
+        constraint.data.maxDiscs++;
+        updateConstraintBadge(constraint); // Update badge appearance
+    } else if (event.event.button === 2) {
+        // Decrease constraint number, but not below zero
+        if (constraint.data.maxDiscs > 0) {
+            constraint.data.maxDiscs--;
+            updateConstraintBadge(constraint);
+        }
+    }
+ };
+
+
+    // --- Store for future updates/removal ---
+    constraint.data.badgeGroup = badgeGroup;
+}
+
+
+// --- Selection, Editing, and Deletion ---
+function selectConstraint(constraint) {
+  clearSelection();
+  selectedObj = constraint;
+  constraint.selected = true;
+  document.getElementById('deleteBtn').classList.remove('hidden');
+  if (constraint.data.type === 'polygon') showVertexHandles(constraint);
+  if (constraint.data.type === 'rectangle') showRectHandles(constraint);
+  if (constraint.data.type === 'ellipse') showEllipseHandles(constraint);
+}
+function selectDisc(disc) {
+  clearSelection();
+  selectedObj = disc;
+  disc.selected = true;
+  document.getElementById('deleteBtn').classList.remove('hidden');
+}
+function clearSelection() {
+  if (selectedObj) selectedObj.selected = false;
+  removeVertexHandles();
+  selectedObj = null;
+  document.getElementById('deleteBtn').classList.add('hidden');
+}
+function deleteSelected() {
+  if (!selectedObj) return;
+  if (selectedObj.data && selectedObj.data.isConstraint) {
+    if (selectedObj.data.label) selectedObj.data.label.remove();
+    if (selectedObj.data.badgeGroup) {
+      selectedObj.data.badgeGroup.remove();
+      selectedObj.data.badgeGroup = null;
+    }
+    constraints = constraints.filter(c => c !== selectedObj);
+    selectedObj.remove();
+  } else if (selectedObj.data && selectedObj.data.isDisc) {
+    discs = discs.filter(d => d !== selectedObj);
+    selectedObj.remove();
+  }
+  clearSelection();
+  updateDiscsForConstraint();
+  updateExclusionZones();
+}
+document.addEventListener('keydown', function(e) {
+  if ((e.key === 'Delete' || e.key === 'Backspace') && selectedObj) {
+    deleteSelected();
+  }
+  if (creatingPolygon && (e.key === 'Backspace' || e.key === 'Delete')) {
+    undoPolygonPoint();
+  }
+  if (creatingPolygon && e.key === 'Escape') {
+    cancelPolygon();
+  }
+});
+
+function showRectHandles(rect) {
+  removeVertexHandles();
+
+  let corners = [
+    rect.segments[0].point,
+    rect.segments[1].point,
+    rect.segments[2].point,
+    rect.segments[3].point
+  ];
+
+  corners.forEach((pt, idx) => {
+    let handle = new paper.Path.Circle({
+      center: pt,
+      radius: 7,
+      fillColor: 'orange',
+      strokeColor: 'blue',
+      strokeWidth: 2,
+      data: {isHandle: true}
+    });
+
+    let startOpposite, startCenter, startAngle;
+
+    handle.onMouseDown = function(e) {
+      startOpposite = rect.segments[(idx + 2) % 4].point.clone();
+      startCenter = rect.segments[0].point.add(rect.segments[2].point).divide(2);
+      let v1 = rect.segments[1].point.subtract(rect.segments[0].point);
+      startAngle = v1.angle;
+    };
+
+    handle.onMouseDrag = function(e) {
+      let localDragged = e.point.subtract(startCenter).rotate(-startAngle);
+      let localOpposite = startOpposite.subtract(startCenter).rotate(-startAngle);
+
+      let newWidth = Math.abs(localDragged.x - localOpposite.x);
+      let newHeight = Math.abs(localDragged.y - localOpposite.y);
+
+      newWidth = Math.max(newWidth, 10);
+      newHeight = Math.max(newHeight, 10);
+
+      let newLocalCenter = new paper.Point(
+        (localDragged.x + localOpposite.x) / 2,
+        (localDragged.y + localOpposite.y) / 2
+      );
+      let newCenter = newLocalCenter.rotate(startAngle).add(startCenter);
+
+      let hw = newWidth / 2, hh = newHeight / 2;
+      let newLocalCorners = [
+        new paper.Point(-hw, -hh),
+        new paper.Point(hw, -hh),
+        new paper.Point(hw, hh),
+        new paper.Point(-hw, hh)
+      ];
+      let newWorldCorners = newLocalCorners.map(pt => pt.rotate(startAngle).add(newCenter));
+
+      for (let i = 0; i < 4; i++) {
+        rect.segments[i].point = newWorldCorners[i];
+      }
+      updateConstraintBadge(rect);
+      updateDiscsForConstraint();
+      updateExclusionZones();
+      showRectHandles(rect);
+    };
+
+    vertexHandles.push(handle);
+    uiLayer.addChild(handle);
+  });
+
+  // --- Rotation Handle ---
+  let topLeft = corners[0];
+  let topRight = corners[1];
+  let topCenter = topLeft.add(topRight).divide(2);
+  let v1 = topRight.subtract(topLeft);
+  let angle = v1.angle;
+  let handleDistance = 40;
+  let offset = new paper.Point(0, -handleDistance).rotate(angle);
+  let rotationHandlePos = topCenter.add(offset);
+
+  let rotHandle = new paper.Path.Circle({
+    center: rotationHandlePos,
+    radius: 7,
+    fillColor: 'yellow',
+    strokeColor: 'orange',
+    strokeWidth: 2,
+    data: {isHandle: true}
+  });
+
+  let rotLine = new paper.Path.Line({
+    from: topCenter,
+    to: rotationHandlePos,
+    guide: true,
+    strokeColor: 'orange',
+    strokeWidth: 2,
+    dashArray: [4, 4]
+  });
+
+  let startVector = null;
+  let startAngle2 = null;
+  let startCorners2 = null;
+  let startCenter2 = null;
+  rotHandle.onMouseDown = function(e) {
+    startVector = e.point.subtract(topCenter);
+    // Store the corners and center at drag start
+    startCorners2 = [
+      rect.segments[0].point.clone(),
+      rect.segments[1].point.clone(),
+      rect.segments[2].point.clone(),
+      rect.segments[3].point.clone()
+    ];
+    startCenter2 = startCorners2[0].add(startCorners2[2]).divide(2);
+    let v1 = startCorners2[1].subtract(startCorners2[0]);
+    startAngle2 = v1.angle;
+  };
+  rotHandle.onMouseDrag = function(e) {
+    if (!startVector) return;
+    let currentVector = e.point.subtract(topCenter);
+    let angleDelta = currentVector.angle - startVector.angle;
+
+    // Rotate all corners around the center
+    let newCorners = startCorners2.map(pt =>
+      pt.subtract(startCenter2).rotate(angleDelta).add(startCenter2)
+    );
+    for (let i = 0; i < 4; i++) {
+      rect.segments[i].point = newCorners[i];
+    }
+    updateConstraintBadge(rect);
+    updateDiscsForConstraint();
+    updateExclusionZones();
+    showRectHandles(rect);
+  };
+
+  vertexHandles.push(rotHandle, rotLine);
+  uiLayer.addChild(rotHandle);
+  uiLayer.addChild(rotLine);
+}
+
+function showEllipseHandles(ellipse) {
+  removeVertexHandles();
+
+  // Get center and local axes
+  let center = ellipse.position.clone();
+  let localY = ellipse.segments[0].point.subtract(center);
+  let ry = localY.length;
+  let localX = ellipse.segments[1].point.subtract(center);
+  let rx = localX.length;
+  let angle = localX.angle;
+
+  // Cardinal points in local space
+  let localHandles = [
+    new paper.Point(0, -ry),   // Top
+    new paper.Point(rx, 0),    // Right
+    new paper.Point(0, ry),    // Bottom
+    new paper.Point(-rx, 0)    // Left
+  ];
+  // Rotate and translate to world space
+  let worldHandles = localHandles.map(pt => pt.rotate(angle).add(center));
+
+  // --- Resize Handles ---
+  worldHandles.forEach((pt, idx) => {
+    let handle = new paper.Path.Circle({
+      center: pt,
+      radius: 7,
+      fillColor: 'orange',
+      strokeColor: 'green',
+      strokeWidth: 2,
+      data: {isHandle: true}
+    });
+
+    let startPoints, startHandlesIn, startHandlesOut, startCenter, startAngle, startRx, startRy;
+
+    handle.onMouseDown = function(e) {
+      startPoints = ellipse.segments.map(seg => seg.point.clone());
+      startHandlesIn = ellipse.segments.map(seg => seg.handleIn.clone());
+      startHandlesOut = ellipse.segments.map(seg => seg.handleOut.clone());
+      startCenter = ellipse.position.clone();
+      let localY = ellipse.segments[0].point.subtract(startCenter);
+      let localX = ellipse.segments[1].point.subtract(startCenter);
+      startRy = localY.length;
+      startRx = localX.length;
+      startAngle = localX.angle;
+    };
+
+    handle.onMouseDrag = function(e) {
+      // Transform mouse point to ellipse local space (unrotate)
+      let localMouse = e.point.subtract(startCenter).rotate(-startAngle);
+
+      let scaleX = 1, scaleY = 1;
+      if (idx === 0 || idx === 2) {
+        // Top or bottom handle: vertical scale (local y)
+        let newRy = Math.max(Math.abs(localMouse.y), 10);
+        scaleY = newRy / startRy;
+      } else {
+        // Left or right handle: horizontal scale (local x)
+        let newRx = Math.max(Math.abs(localMouse.x), 10);
+        scaleX = newRx / startRx;
+      }
+
+      for (let i = 0; i < ellipse.segments.length; i++) {
+        // Scale anchor points
+        let local = startPoints[i].subtract(startCenter).rotate(-startAngle);
+        let scaled = new paper.Point(local.x * scaleX, local.y * scaleY);
+        ellipse.segments[i].point = scaled.rotate(startAngle).add(startCenter);
+
+        // Scale handleIn
+        let handleIn = startHandlesIn[i].rotate(-startAngle);
+        ellipse.segments[i].handleIn = new paper.Point(handleIn.x * scaleX, handleIn.y * scaleY).rotate(startAngle);
+
+        // Scale handleOut
+        let handleOut = startHandlesOut[i].rotate(-startAngle);
+        ellipse.segments[i].handleOut = new paper.Point(handleOut.x * scaleX, handleOut.y * scaleY).rotate(startAngle);
+      }
+
+      updateConstraintBadge(ellipse);
+      updateDiscsForConstraint();
+      updateExclusionZones();
+      showEllipseHandles(ellipse);
+    };
+
+    vertexHandles.push(handle);
+    uiLayer.addChild(handle);
+  });
+
+  // --- Rotation Handle ---
+  let handleDistance = 40;
+  let rotationHandlePos = new paper.Point(0, -ry - handleDistance).rotate(angle).add(center);
+
+  let rotHandle = new paper.Path.Circle({
+    center: rotationHandlePos,
+    radius: 7,
+    fillColor: 'yellow',
+    strokeColor: 'orange',
+    strokeWidth: 2,
+    data: {isHandle: true}
+  });
+
+  let rotLine = new paper.Path.Line({
+    from: worldHandles[0], // top handle
+    to: rotationHandlePos,
+    guide: true,
+    strokeColor: 'orange',
+    strokeWidth: 2,
+    dashArray: [4, 4]
+  });
+
+  let startVector = null;
+  let startPoints = null;
+  let startHandlesIn = null;
+  let startHandlesOut = null;
+  let startCenter2 = null;
+  let startAngle2 = null;
+  rotHandle.onMouseDown = function(e) {
+    startVector = e.point.subtract(center);
+    startPoints = ellipse.segments.map(seg => seg.point.clone());
+    startHandlesIn = ellipse.segments.map(seg => seg.handleIn.clone());
+    startHandlesOut = ellipse.segments.map(seg => seg.handleOut.clone());
+    startCenter2 = ellipse.position.clone();
+    let localX = ellipse.segments[1].point.subtract(startCenter2);
+    startAngle2 = localX.angle;
+  };
+  rotHandle.onMouseDrag = function(e) {
+    if (!startVector) return;
+    let currentVector = e.point.subtract(center);
+    let angleDelta = currentVector.angle - startVector.angle;
+    for (let i = 0; i < ellipse.segments.length; i++) {
+      ellipse.segments[i].point = startPoints[i].subtract(startCenter2).rotate(angleDelta).add(startCenter2);
+      ellipse.segments[i].handleIn = startHandlesIn[i].rotate(angleDelta);
+      ellipse.segments[i].handleOut = startHandlesOut[i].rotate(angleDelta);
+    }
+    updateConstraintBadge(ellipse);
+    updateDiscsForConstraint();
+    updateExclusionZones();
+    showEllipseHandles(ellipse);
+  };
+
+  vertexHandles.push(rotHandle, rotLine);
+  uiLayer.addChild(rotHandle);
+  uiLayer.addChild(rotLine);
+}
+// --- Polygon Vertex Editing ---
+function showVertexHandles(polygon) {
+  removeVertexHandles();
+  polygon.segments.forEach((seg, idx) => {
+    let handle = new paper.Path.Circle({
+      center: seg.point,
+      radius: 7,
+      fillColor: 'pink',
+      strokeColor: 'red',
+      strokeWidth: 2
+    });
+    handle.segment = seg;
+    handle.onMouseDrag = function(e) {
+      seg.point = e.point;
+      handle.position = seg.point;
+      updateConstraintBadge(polygon);
+      updateDiscsForConstraint();
+      updateExclusionZones();
+    };
+    vertexHandles.push(handle);
+    uiLayer.addChild(handle);
+  });
+}
+function removeVertexHandles() {
+  vertexHandles.forEach(h => h.remove());
+  vertexHandles = [];
+}
+
+// --- Constraint Moving ---
+//function moveConstraint(constraint, e) {
+//  constraint.position = e.point;
+//  if (constraint.data.label) constraint.data.label.point = e.point;
+//  updateDiscsForConstraint();
+//  updateExclusionZones();
+//  if (constraint.data.type === 'polygon') showVertexHandles(constraint);
+//}
+
+function saveConstraintsToURL() {
+  const constraintsData = constraints.map(constraint => {
+    const data = { type: constraint.data.type, numDiscs: constraint.data.maxDiscs };
+
+    if (data.type === 'polygon') {
+      data.points = constraint.segments.map(s => ({ x: s.point.x, y: s.point.y }));
+    } else if (data.type === 'rectangle' || data.type === 'ellipse') {
+      data.position = { x: constraint.position.x, y: constraint.position.y };
+      let rot = constraint.data.getRotation();
+      data.rotation = rot.angle;
+      data.width = rot.width;
+      data.height = rot.height;
+    }
+    // Add other properties as needed
+    return data;
+  });
+  const jsonString = JSON.stringify(constraintsData);
+  //const encoded = encodeURIComponent(jsonString);
+  const encoded = LZString.compressToEncodedURIComponent(jsonString);
+  const url = `${window.location.origin}${window.location.pathname}#constraints=${encoded}`;
+  window.history.replaceState(null, '', url);
+}
+
+function loadConstraintsFromURL() {
+  const hash = window.location.hash;
+  if (!hash.startsWith('#constraints=')) return;
+
+  const encoded = hash.slice('#constraints='.length);
+  //const jsonString = decodeURIComponent(encoded);
+  const jsonString = LZString.decompressFromEncodedURIComponent(encoded);
+  const constraintsData = JSON.parse(jsonString);
+
+  constraintsData.forEach(data => {
+    let numDiscs = data.numDiscs || 0;
+    if (data.type === 'polygon') {
+      createPolygonConstraint(
+          numDiscs, data.points.map(p => new paper.Point(p.x, p.y)));
+    } else if (data.type === 'rectangle') {
+      createRectangleConstraint(numDiscs, data.position, data.width, data.height, data.rotation);
+    } else if (data.type === 'ellipse') {
+      createEllipseConstraint(numDiscs, data.position, data.width, data.height, data.rotation);
+    }
+  });
+}
+
+// --- Initial Layer Order ---
+exclusionLayer.sendToBack();
+constraintLayer.bringToFront();
+discLayer.bringToFront();
+uiLayer.bringToFront();
+loadConstraintsFromURL();
+
+paper.view.onFrame = function() {
+  // Keep UI elements on top
+  uiLayer.bringToFront();
+  vertexHandles.forEach(handle => {
+    if (handle.segment) handle.position = handle.segment.point;
+  });
+};
+
+</script>
+</body>
+</html>
