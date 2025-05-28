@@ -4,12 +4,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Little Discs</title>
   <style>
-    body { margin:0; }
+    html, body { height: 100%; margin: 0; padding: 0; }
     #toolbar {
       position:fixed; top:10px; left:10px; z-index:10;
       background:#fff; padding:8px; border-radius:8px;
     }
-    #canvas { background: #f0ffff; }
+    #canvas { background: #f0ffff; width: 1000px; height: 700px; display: block; }
     .hidden { display: none; }
   </style>
 </head>
@@ -36,16 +36,48 @@
   <button id="deleteBtn" class="hidden">Delete</button>
   <button id="saveBtn" onclick="saveConstraintsToURL()">Save constraints</button>
 </div>
-<canvas id="canvas" resize width="1000" height="700"></canvas>
+<canvas id="canvas"></canvas>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/paper.js/0.12.17/paper-full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/lz-string@1.4.4/libs/lz-string.min.js"></script>
-
 <script>
+const DESIGN_WIDTH = 1000;
+const DESIGN_HEIGHT = 700;
+
+function resizePaperCanvas() {
+  const DESIGN_WIDTH = 1000;
+  const DESIGN_HEIGHT = 700;
+  const aspect = DESIGN_WIDTH / DESIGN_HEIGHT;
+  const windowWidth = window.innerWidth;
+  const windowHeight = window.innerHeight;
+  let canvasWidth, canvasHeight;
+
+  if (windowWidth / windowHeight > aspect) {
+    canvasHeight = windowHeight;
+    canvasWidth = canvasHeight * aspect;
+  } else {
+    canvasWidth = windowWidth;
+    canvasHeight = canvasWidth / aspect;
+  }
+
+  const canvas = document.getElementById('canvas');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = canvasWidth * dpr;
+  canvas.height = canvasHeight * dpr;
+  canvas.style.width = canvasWidth + 'px';
+  canvas.style.height = canvasHeight + 'px';
+
+  paper.view.viewSize = new paper.Size(canvasWidth, canvasHeight);
+  paper.view.zoom = canvasWidth / DESIGN_WIDTH;
+  paper.view.center = new paper.Point(DESIGN_WIDTH / 2, DESIGN_HEIGHT / 2);
+}
+
 paper.settings.hitTolerance = 30;  // make strokes easier to grab
 paper.setup('canvas');
-paper.view.element.addEventListener('contextmenu', function(e) {
-    e.preventDefault();
-});
+window.addEventListener('resize', resizePaperCanvas);
+resizePaperCanvas();
+//paper.view.element.addEventListener('contextmenu', function(e) {
+//    e.preventDefault();
+//});
 
 // --- App State ---
 let mode = document.querySelector('input[name="mode"]:checked').value;
@@ -1297,6 +1329,7 @@ function loadConstraintsFromURL() {
       createEllipseConstraint(numDiscs, data.position, data.width, data.height, data.rotation);
     }
   });
+  resizePaperCanvas();
 }
 
 // --- Initial Layer Order ---
