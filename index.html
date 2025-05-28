@@ -65,16 +65,23 @@ function resizePaperCanvas() {
   canvas.height = canvasHeight * dpr;
   canvas.style.width = canvasWidth + 'px';
   canvas.style.height = canvasHeight + 'px';
+  canvas.offsetHeight; // Force a layout pass?
 
+  if (!paper.view) {
+    paper.setup('canvas');
+  }
   paper.view.viewSize = new paper.Size(canvasWidth, canvasHeight);
   paper.view.zoom = canvasWidth / DESIGN_WIDTH;
   paper.view.center = new paper.Point(DESIGN_WIDTH / 2, DESIGN_HEIGHT / 2);
 }
 
 paper.settings.hitTolerance = 30;  // make strokes easier to grab
-paper.setup('canvas');
 window.addEventListener('resize', resizePaperCanvas);
+window.addEventListener('orientationchange', resizePaperCanvas);
+window.addEventListener('load', resizePaperCanvas);
+window.addEventListener('DOMContentLoaded', resizePaperCanvas);
 resizePaperCanvas();
+
 //paper.view.element.addEventListener('contextmenu', function(e) {
 //    e.preventDefault();
 //});
