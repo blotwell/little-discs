@@ -1279,6 +1279,11 @@ function showVertexHandles(polygon) {
     uiLayer.addChild(handle);
   });
 }
+//function updateVertexHandles() {
+//  vertexHandles.forEach(handle => {
+//    if (handle.segment) handle.position = handle.segment.point;
+//  });
+//}
 function removeVertexHandles() {
   vertexHandles.forEach(h => h.remove());
   vertexHandles = [];
@@ -1346,13 +1351,6 @@ discLayer.bringToFront();
 uiLayer.bringToFront();
 loadConstraintsFromURL();
 
-paper.view.onFrame = function() {
-  // Keep UI elements on top
-  uiLayer.bringToFront();
-  vertexHandles.forEach(handle => {
-    if (handle.segment) handle.position = handle.segment.point;
-  });
-};
 
 </script>
 </body>
