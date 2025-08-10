@@ -93,6 +93,7 @@ let constraints = [];
 let discs = [];
 let discRadius = 12;
 let maxDiscsPerConstraint = 3;
+let constraintWidth = 2;
 let discPreview = null;
 let creatingPolygon = false;
 let polygonPoints = [];
@@ -100,6 +101,7 @@ let polygonTempPath = null;
 let polygonTempHandles = [];
 let selectedObj = null;
 let vertexHandles = [];
+let restriction = null;
 let exclusionLayer = new paper.Layer();
 let discLayer = new paper.Layer();
 let constraintLayer = new paper.Layer();
@@ -194,7 +196,7 @@ function handlePolygonCreation(point) {
     polygonTempPath = new paper.Path({
       segments: [point],
       strokeColor: 'red',
-      strokeWidth: 4,
+      strokeWidth: constraintWidth,
       fullySelected: false,
       dashArray: [6, 6]
     });
@@ -225,7 +227,7 @@ function createPolygonConstraint(numDiscs, polygonPoints) {
     closed: true,
     fillColor: null,  // new paper.Color(1,0,0,0.1),
     strokeColor: 'red',
-    strokeWidth: 4,
+    strokeWidth: constraintWidth,
     data: { isConstraint: true, type: 'polygon', discs: [], maxDiscs: numDiscs }
   });
   constraintLayer.addChild(poly);
@@ -314,7 +316,7 @@ function createRectangleConstraint(numDiscs, centre, width, height, rotation) {
     size: [width, height],
     fillColor: null,  // new paper.Color(0,0,1,0.1),
     strokeColor: 'blue',
-    strokeWidth: 4,
+    strokeWidth: constraintWidth,
     data: { isConstraint: true, type: 'rectangle', discs: [], maxDiscs: numDiscs }
   });
   rect.rotate(rotation, centre);
@@ -671,12 +673,13 @@ function distanceToRotatedRectangle(P, center, width, height, angle) {
 
 
 // --- Exclusion Zones (forbidden cones) ---
+// --- Todo: make this work for 4-in-a-row ---
 function updateExclusionZones() {
   exclusionLayer.removeChildren();
   exclusionLayer.activate();
   for (let i = 0; i < discs.length; i++) {
     for (let j = i+1; j < discs.length; j++) {
-      drawForbiddenZone(discs[i], discs[j], (discs[i].data.isDragging || discs[j].data.isDragging));
+      //drawForbiddenZone(discs[i], discs[j], (discs[i].data.isDragging || discs[j].data.isDragging));
     }
   }
   discLayer.activate();
@@ -751,8 +754,85 @@ function drawForbiddenZone(discA, discB, preview = false) {
   //band.fillColor = new paper.Color(0.8,0.8,0.8,0.3);
 }
 
-// --- Forbidden Cone Logic for Placement ---
-function isInForbiddenCone(p, aDisc, bDisc) {
+// test if c and d are both between a and b
+function isInForbiddenImpl(a, b, c, d) {
+  const bandWidth = 2*discRadius;
+  const AB = a.getDistance(b);
+  const perpx = discRadius * (b.y - a.y) / AB;
+  const perpy = discRadius * (a.x - b.x) / AB;
+     {
+  const ax = a.x + perpx;
+  const ay = a.y + perpy;
+  const bx = b.x - perpx;
+  const by = b.y - perpy;
+  const baseLength = Math.sqrt((bx-ax)*(bx-ax) + (by-ay)*(by-ay));
+  const bandDistanceC = Math.abs(
+      (by - ay)*c.x - (bx - ax)*c.y + bx*ay - ax*by
+  ) / baseLength;
+  const bandDistanceD = Math.abs(
+      (by - ay)*d.x - (bx - ax)*d.y + bx*ay - ax*by
+  ) / baseLength;
+  if (bandDistanceC < discRadius && bandDistanceD < discRadius) {
+      if (restriction) {restriction.remove()};
+      restriction = new paper.Path({
+          segments: [new paper.Point(ax, ay), new paper.Point(bx, by)],
+          strokeColor: new paper.Color(0.8,0.0,0.0,1.0),
+          dashArray: [6,6],
+          opacity: 1,
+          strokeWidth: 3
+      });
+    return true;
+  }
+     }
+     {
+  const ax = a.x - perpx;
+  const ay = a.y - perpy;
+  const bx = b.x + perpx;
+  const by = b.y + perpy;
+  const baseLength = Math.sqrt((bx-ax)*(bx-ax) + (by-ay)*(by-ay));
+  const bandDistanceC = Math.abs(
+      (by - ay)*c.x - (bx - ax)*c.y + bx*ay - ax*by
+  ) / baseLength;
+  const bandDistanceD = Math.abs(
+      (by - ay)*d.x - (bx - ax)*d.y + bx*ay - ax*by
+  ) / baseLength;
+  if (bandDistanceC < discRadius && bandDistanceD < discRadius) {
+      if (restriction) {restriction.remove()};
+      restriction = new paper.Path({
+          segments: [new paper.Point(ax, ay), new paper.Point(bx, by)],
+          strokeColor: new paper.Color(0.8,0.0,0.0,1.0),
+          dashArray: [6,6],
+          opacity: 1,
+          strokeWidth: 3
+      });
+    return true;
+  }
+     }
+  if (restriction) {restriction.remove()};
+  restriction = null;
+  return false;
+}
+
+function isInForbiddenCone(p, aDisc, bDisc, cDisc) {
+  const a = aDisc.position;
+  const b = bDisc.position;
+  const c = cDisc.position;
+  const x = (isInForbiddenImpl(a, b, c, p)
+    || isInForbiddenImpl(a, c, b, p)       
+    || isInForbiddenImpl(a, p, b, c)       
+    || isInForbiddenImpl(b, c, a, p)       
+    || isInForbiddenImpl(b, p, a, c)       
+    || isInForbiddenImpl(c, p, a, b));
+     if (x === false) {
+       if (restriction) {restriction.remove()};
+       restriction = null;
+     }
+     return x;
+}
+
+
+// --- obsolete 3-disc logic ---
+function isInForbiddenCone3(p, aDisc, bDisc) {
   const a = aDisc.position;
   const b = bDisc.position;
   const AB = a.getDistance(b);
@@ -794,9 +874,11 @@ function isValidDiscPosition(pos, movingDisc = null) {
   // 2. Forbidden cone check
   for (let i = 0; i < discs.length; i++) {
     for (let j = i+1; j < discs.length; j++) {
-      const a = discs[i], b = discs[j];
-      if (a === movingDisc || b === movingDisc) continue;
-      if (isInForbiddenCone(pos, a, b)) return false;
+      for (let k = j+1; k < discs.length; k++) {
+        const a = discs[i], b = discs[j], c = discs[k];
+        if (a === movingDisc || b === movingDisc || c == movingDisc) continue;
+        if (isInForbiddenCone(pos, a, b, c)) return false;
+      }
     }
   }
   // 3. Constraint check
