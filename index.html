@@ -67,9 +67,6 @@ function resizePaperCanvas() {
   canvas.style.height = canvasHeight + 'px';
   canvas.offsetHeight; // Force a layout pass?
 
-  if (!paper.view) {
-    paper.setup('canvas');
-  }
   if (!canvas) { return; }
   paper.view.viewSize = new paper.Size(canvasWidth, canvasHeight);
   paper.view.zoom = canvasWidth / DESIGN_WIDTH;
@@ -77,20 +74,13 @@ function resizePaperCanvas() {
   paper.view.update();
 }
 
-paper.settings.hitTolerance = 30;  // make strokes easier to grab
-window.addEventListener('resize', resizePaperCanvas);
-window.addEventListener('orientationchange', resizePaperCanvas);
-//window.addEventListener('load', resizePaperCanvas);
-window.addEventListener('DOMContentLoaded', resizePaperCanvas);
-resizePaperCanvas();
-
 //paper.view.element.addEventListener('contextmenu', function(e) {
 //    e.preventDefault();
 //});
 
 // --- App State ---
-let mode = document.querySelector('input[name="mode"]:checked').value;
-let constraintType = document.getElementById('constraintType').value;
+let mode = null;
+let constraintType = null;
 let constraints = [];
 let discs = [];
 let discRadius = 12;
@@ -104,74 +94,108 @@ let polygonTempHandles = [];
 let selectedObj = null;
 let vertexHandles = [];
 let restriction = null;
-let exclusionLayer = new paper.Layer();
-let discLayer = new paper.Layer();
-let constraintLayer = new paper.Layer();
-let uiLayer = new paper.Layer();
-exclusionLayer.activate();
+let exclusionLayer = null;
+let discLayer = null;
+let constraintLayer = null;
+let uiLayer = null;
+let tool = null;
 
+ 
 function enterMode(mode) {
   this.mode = mode;
   this.currentConstraint = null;
   constraintLayer.locked = (this.mode === "move");
 }
-enterMode(mode);
 
-// --- UI Controls ---
-// Listen for changes on the radio group
-document.getElementById('modeRadios').addEventListener('change', (e) => {
-  if (e.target.name === 'mode') {
-    mode = e.target.value;
-    enterMode(mode);
+function startApp() {
+  mode = document.querySelector('input[name="mode"]:checked').value;
+  constraintType = document.getElementById('constraintType').value;
+
+  if (!paper.view) {
+    paper.setup('canvas');
   }
-});
-document.getElementById('constraintType').addEventListener('change', e => {
-  constraintType = e.target.value;
-});
-//document.getElementById('addDisc').addEventListener('click', () => {
-//  showDiscPreview(new paper.Point(400, 300));
+
+  // --- UI Controls ---
+  // Listen for changes on the radio group
+  document.getElementById('modeRadios').addEventListener('change', (e) => {
+    if (e.target.name === 'mode') {
+      mode = e.target.value;
+      enterMode(mode);
+    }
+  });
+  document.getElementById('constraintType').addEventListener('change', e => {
+    constraintType = e.target.value;
+  });
+  //document.getElementById('addDisc').addEventListener('click', () => {
+  //  showDiscPreview(new paper.Point(400, 300));
+  //});
+  document.getElementById('undoPoly').onclick = undoPolygonPoint;
+  document.getElementById('cancelPoly').onclick = cancelPolygon;
+  document.getElementById('deleteBtn').onclick = deleteSelected;
+  
+  // --- Tool Setup ---
+  tool = new paper.Tool();
+  tool.onMouseDown = function(event) {
+    if (mode === 'constraint') {
+      if (constraintType === 'polygon') {
+        handlePolygonCreation(event.point);
+      } else if (constraintType === 'rectangle') {
+        if (!checkOtherHit(event.point)) {
+          selectConstraint(createRectangleConstraint(3, event.point, 80, 80, 0));
+        }
+      } else if (constraintType === 'ellipse') {
+        if (!checkOtherHit(event.point)) {
+          selectConstraint(createEllipseConstraint(3, event.point, 80, 80, 0));
+        }
+      }
+    } else if (mode === 'move') {
+      // handled by disc drag logic
+    }
+  };
+  tool.onMouseMove = function(event) {
+    if (creatingPolygon && polygonPoints.length > 0) {
+      updatePolygonPreview(event.point);
+    }
+    if (discPreview) {
+      discPreview.position = event.point;
+      updateDiscPreviewColor(event.point);
+    }
+  };
+  tool.onMouseUp = function(event) {
+    //if (discPreview)
+    if (mode === 'move') {
+      if (isValidDiscPosition(event.point)) {
+        addDisc(event.point);
+      }
+      removeDiscPreview();
+    }
+  };
+
+  exclusionLayer = new paper.Layer();
+  discLayer = new paper.Layer();
+  constraintLayer = new paper.Layer();
+  uiLayer = new paper.Layer();
+  exclusionLayer.activate();
+  // --- Initial Layer Order ---
+  exclusionLayer.sendToBack();
+  constraintLayer.bringToFront();
+  discLayer.bringToFront();
+  uiLayer.bringToFront();
+//var background = new paper.Path.Rectangle({
+//  point: [0, 0],
+//  size: [1000, 700],
+//  fillColor: '#f0ffff'
 //});
-document.getElementById('undoPoly').onclick = undoPolygonPoint;
-document.getElementById('cancelPoly').onclick = cancelPolygon;
-document.getElementById('deleteBtn').onclick = deleteSelected;
+//background.sendToBack();
+  enterMode(mode);
+  loadConstraintsFromURL();
 
-// --- Tool Setup ---
-let tool = new paper.Tool();
-tool.onMouseDown = function(event) {
-  if (mode === 'constraint') {
-    if (constraintType === 'polygon') {
-      handlePolygonCreation(event.point);
-    } else if (constraintType === 'rectangle') {
-      if (!checkOtherHit(event.point)) {
-        selectConstraint(createRectangleConstraint(3, event.point, 80, 80, 0));
-      }
-    } else if (constraintType === 'ellipse') {
-      if (!checkOtherHit(event.point)) {
-        selectConstraint(createEllipseConstraint(3, event.point, 80, 80, 0));
-      }
-    }
-  } else if (mode === 'move') {
-    // handled by disc drag logic
-  }
-};
-tool.onMouseMove = function(event) {
-  if (creatingPolygon && polygonPoints.length > 0) {
-    updatePolygonPreview(event.point);
-  }
-  if (discPreview) {
-    discPreview.position = event.point;
-    updateDiscPreviewColor(event.point);
-  }
-};
-tool.onMouseUp = function(event) {
-  //if (discPreview)
-  if (mode === 'move') {
-    if (isValidDiscPosition(event.point)) {
-      addDisc(event.point);
-    }
-    removeDiscPreview();
-  }
-};
+  paper.settings.hitTolerance = 30;  // make strokes easier to grab
+  window.addEventListener('resize', resizePaperCanvas);
+  window.addEventListener('orientationchange', resizePaperCanvas);
+  window.addEventListener('DOMContentLoaded', resizePaperCanvas);
+  resizePaperCanvas();
+}
 
 function checkOtherHit(point) {
   let hitProject = paper.project.hitTest(point, { fill: true, stroke: true, tolerance: 0 });
@@ -1408,6 +1432,7 @@ function saveConstraintsToURL() {
 function loadConstraintsFromURL() {
   const hash = window.location.hash;
   if (!hash.startsWith('#constraints=')) return;
+    resizePaperCanvas();
 
   const encoded = hash.slice('#constraints='.length);
   //const jsonString = decodeURIComponent(encoded);
@@ -1425,15 +1450,9 @@ function loadConstraintsFromURL() {
       createEllipseConstraint(numDiscs, data.position, data.width, data.height, data.rotation);
     }
   });
-  resizePaperCanvas();
 }
 
-// --- Initial Layer Order ---
-exclusionLayer.sendToBack();
-constraintLayer.bringToFront();
-discLayer.bringToFront();
-uiLayer.bringToFront();
-loadConstraintsFromURL();
+window.addEventListener('load', startApp);
 
 
 </script>
