@@ -9,7 +9,7 @@
       position:fixed; top:10px; left:10px; z-index:10;
       background:#fff; padding:8px; border-radius:8px;
     }
-    #canvas { background: #f0ffff; width: 1000px; height: 700px; display: block; }
+    #canvas { background: #f0ffff; width: 100%; height: 100%; display: block; }
     .hidden { display: none; }
   </style>
 </head>
@@ -70,15 +70,17 @@ function resizePaperCanvas() {
   if (!paper.view) {
     paper.setup('canvas');
   }
+  if (!canvas) { return; }
   paper.view.viewSize = new paper.Size(canvasWidth, canvasHeight);
   paper.view.zoom = canvasWidth / DESIGN_WIDTH;
   paper.view.center = new paper.Point(DESIGN_WIDTH / 2, DESIGN_HEIGHT / 2);
+  paper.view.update();
 }
 
 paper.settings.hitTolerance = 30;  // make strokes easier to grab
 window.addEventListener('resize', resizePaperCanvas);
 window.addEventListener('orientationchange', resizePaperCanvas);
-window.addEventListener('load', resizePaperCanvas);
+//window.addEventListener('load', resizePaperCanvas);
 window.addEventListener('DOMContentLoaded', resizePaperCanvas);
 resizePaperCanvas();
 
